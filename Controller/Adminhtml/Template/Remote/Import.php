@@ -60,19 +60,25 @@ class Import extends Action implements HttpPostActionInterface
             if ($credentials === false) {
                 throw new LocalizedException(__("Remote storage not found."));
             }
-            $importExportPath = $this->filesystem
-                ->getDirectoryRead(DirectoryList::VAR_IMPORT_EXPORT)
-                ->getAbsolutePath();
-            $tmpTemplateDownloadPath = $importExportPath . '/tmp-template.zip';
-            $this->dropbox->downloadZip(
-                $remoteTemplate->getData("file_path"),
-                $tmpTemplateDownloadPath,
-                $credentials["app_key"],
-                $credentials["app_secret"],
-                $credentials["refresh_token"],
-            );
-            $importedTemplate = $this->templateManagement
-                ->importTemplateFromArchive($tmpTemplateDownloadPath, $remoteTemplate["file_path"]);
+            $importExportWrite = $this->filesystem->getDirectoryWrite(DirectoryList::VAR_IMPORT_EXPORT);
+            $downloadRelativePath = 'tmp-template-' . uniqid() . '.zip';
+            $tmpTemplateDownloadPath = $importExportWrite->getAbsolutePath($downloadRelativePath);
+
+            try {
+                $this->dropbox->downloadZip(
+                    $remoteTemplate->getData("file_path"),
+                    $tmpTemplateDownloadPath,
+                    $credentials["app_key"],
+                    $credentials["app_secret"],
+                    $credentials["refresh_token"],
+                );
+                $importedTemplate = $this->templateManagement
+                    ->importTemplateFromArchive($tmpTemplateDownloadPath, $remoteTemplate["file_path"]);
+            } finally {
+                if ($importExportWrite->isExist($downloadRelativePath)) {
+                    $importExportWrite->delete($downloadRelativePath);
+                }
+            }
             $importedTemplateId = $importedTemplate->getId();
             $externalUrls = $this->templateManagement->doSecurityScanForTemplate($importedTemplate->getTemplate());
 

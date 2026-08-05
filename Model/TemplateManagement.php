@@ -12,6 +12,7 @@ use Magento\Framework\DB\DataConverter\DataConversionException;
 use Magento\Framework\Exception\FileSystemException;
 use Magento\Framework\Exception\InputException;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\Exception\ValidatorException;
 use Magento\Framework\Filesystem\Directory\WriteInterface;
 use Magento\PageBuilder\Api\Data\TemplateInterface;
 use Magento\Framework\Api\SearchCriteriaBuilder;
@@ -27,11 +28,13 @@ use Magento\Framework\Api\ImageContentFactory;
 use Magento\Framework\Api\ImageContentValidator;
 use Magento\PageBuilder\Model\TemplateFactory;
 use Magento\Framework\Image\AdapterFactory;
+use Magento\Framework\Image\Adapter\ImageMagick;
 use Magento\MediaStorage\Helper\File\Storage\Database;
 use Magento\Framework\Convert\ConvertArray;
 use Magento\Cms\Model\BlockFactory;
 use Magento\Cms\Api\BlockRepositoryInterface;
 use Magento\Framework\Xml\Parser as XmlParser;
+use Psr\Log\LoggerInterface;
 use ZipArchive;
 use FilesystemIterator;
 use Exception;
@@ -42,6 +45,32 @@ class TemplateManagement implements TemplateManagementInterface
     const EXTERNAL_URL_WHITELIST = [
         'http://www.w3.org/2000/svg'
     ];
+
+    /**
+     * Template asset import is limited to gallery image types; every file is
+     * re-encoded through the image adapter, so nothing that is not a real
+     * image of the type its extension claims can reach pub/media.
+     */
+    private const ALLOWED_ASSET_IMAGE_TYPES = [
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png' => 'image/png',
+        'gif' => 'image/gif',
+        'webp' => 'image/webp',
+    ];
+
+    private const MAX_ARCHIVE_ENTRIES = 1000;
+
+    private const MAX_ARCHIVE_UNCOMPRESSED_SIZE = 268435456; // 256 MB
+
+    /**
+     * Lazily-resolved WebP re-encoding capability of the configured image
+     * adapter. WebP support varies by GD build / ImageMagick delegates, so it
+     * is verified before WebP assets are accepted rather than assumed.
+     *
+     * @var bool|null
+     */
+    private ?bool $webpEncodingSupported = null;
 
     /**
      * @param CmsConverter $cmsConverter
@@ -64,6 +93,8 @@ class TemplateManagement implements TemplateManagementInterface
      * @param SerializerInterface $serializer
      * @param ScopeConfigInterface $scopeConfig
      * @param DeploymentConfig $deploymentConfig
+     * @param PathValidator $pathValidator
+     * @param LoggerInterface $logger
      */
     public function __construct(
         protected CmsConverter $cmsConverter,
@@ -85,7 +116,9 @@ class TemplateManagement implements TemplateManagementInterface
         protected XmlParser $xmlParser,
         protected SerializerInterface $serializer,
         protected ScopeConfigInterface $scopeConfig,
-        protected DeploymentConfig $deploymentConfig
+        protected DeploymentConfig $deploymentConfig,
+        protected PathValidator $pathValidator,
+        protected LoggerInterface $logger
     ) {
     }
 
@@ -112,7 +145,12 @@ class TemplateManagement implements TemplateManagementInterface
 
         foreach ($iterator as $entity) {
             try {
-                if ($entity->isDir()) {
+                if ($entity->isLink()) {
+                    $exceptionMessages[] = sprintf(
+                        'Skipped symbolic link in template assets: %s',
+                        $entity->getFilename()
+                    );
+                } elseif ($entity->isDir()) {
                     $fileName = $entity->getFilename();
                     if (substr($fileName, -1) !== "/") {
                         $fileName = $fileName . "/";
@@ -128,16 +166,100 @@ class TemplateManagement implements TemplateManagementInterface
                     if (substr($destinationPath, -1) !== "/") {
                         $destinationPath = $destinationPath . "/";
                     }
-                    if (!$this->fileIo->fileExists($destinationPath, false)) {
-                        $this->fileIo->mkdir($destinationPath);
+                    $errorMessage = $this->importAssetImage(
+                        $entity->getPathname(),
+                        $destinationPath,
+                        $entity->getFilename()
+                    );
+                    if ($errorMessage !== null) {
+                        $exceptionMessages[] = $errorMessage;
                     }
-                    $this->fileDriver->copy($entity->getPathname(), $destinationPath . $entity->getFilename());
                 }
             } catch (FileSystemException $exception) {
                 $exceptionMessages[] = $exception->getMessage();
             }
         }
         return $exceptionMessages;
+    }
+
+    /**
+     * Validate and re-encode a single template asset image into pub/media.
+     *
+     * Only gallery image types are accepted, the content must actually be an
+     * image of the type its extension claims, and the pixel data is re-encoded
+     * through the image adapter so foreign payloads (PHP in EXIF metadata,
+     * appended data, polyglot files) do not survive the import. Existing media
+     * files are never overwritten; the template keeps referencing the file
+     * that is already there.
+     *
+     * @param string $sourceFile
+     * @param string $destinationDir
+     * @param string $fileName
+     * @return string|null Error message, or null when handled successfully
+     * @throws FileSystemException
+     */
+    private function importAssetImage(string $sourceFile, string $destinationDir, string $fileName): ?string
+    {
+        $extension = strtolower($this->fileIo->getPathInfo($fileName)['extension'] ?? '');
+        if (!isset(self::ALLOWED_ASSET_IMAGE_TYPES[$extension])) {
+            return sprintf('Skipped disallowed template asset file type: %s', $fileName);
+        }
+        if ($extension === 'webp' && !$this->isWebpEncodingSupported()) {
+            return sprintf('Skipped WebP asset; image adapter cannot re-encode WebP: %s', $fileName);
+        }
+
+        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+        $imageInfo = getimagesize($sourceFile);
+        if ($imageInfo === false || ($imageInfo['mime'] ?? '') !== self::ALLOWED_ASSET_IMAGE_TYPES[$extension]) {
+            return sprintf('Skipped template asset that is not a valid %s image: %s', $extension, $fileName);
+        }
+
+        $destinationFile = $destinationDir . $fileName;
+        if ($this->fileIo->fileExists($destinationFile)) {
+            return null;
+        }
+
+        if (!$this->fileIo->fileExists($destinationDir, false)) {
+            $this->fileIo->mkdir($destinationDir);
+        }
+
+        try {
+            $imageAdapter = $this->imageAdapterFactory->create();
+            $imageAdapter->open($sourceFile);
+            $imageAdapter->save($destinationFile);
+        } catch (Exception $e) {
+            return sprintf('Could not process template asset image %s: %s', $fileName, $e->getMessage());
+        }
+        $this->mediaStorage->saveFile($destinationFile);
+
+        return null;
+    }
+
+    /**
+     * Determine whether the configured image adapter can decode and re-encode
+     * WebP. Result is cached for the lifetime of the instance.
+     *
+     * @return bool
+     */
+    private function isWebpEncodingSupported(): bool
+    {
+        if ($this->webpEncodingSupported !== null) {
+            return $this->webpEncodingSupported;
+        }
+
+        $adapter = $this->imageAdapterFactory->create();
+        if ($adapter instanceof ImageMagick) {
+            // phpcs:ignore Magento2.Functions.DiscouragedFunction
+            $this->webpEncodingSupported = class_exists(\Imagick::class)
+                && !empty(\Imagick::queryFormats('WEBP'));
+        } else {
+            // GD-based adapter (Magento default)
+            // phpcs:ignore Magento2.Functions.DiscouragedFunction
+            $gdInfo = function_exists('gd_info') ? gd_info() : [];
+            $this->webpEncodingSupported = !empty($gdInfo['WebP Support']);
+        }
+
+        return $this->webpEncodingSupported;
     }
 
     /**
@@ -185,14 +307,18 @@ class TemplateManagement implements TemplateManagementInterface
             // Generate a thumbnail, called -thumb next to the image for usage in the grid
             $thumbPath = str_replace('.jpg', '-thumb.jpg', $fileName);
             $thumbAbsolutePath = $directory . $thumbPath;
-            $imageFactory = $this->imageAdapterFactory->create();
-            $imageFactory->open($fileAbsolutePath);
-            $imageFactory->resize(350);
 
             try {
+                $imageFactory = $this->imageAdapterFactory->create();
+                $imageFactory->open($fileAbsolutePath);
+                // Re-encode in place so foreign payloads (e.g. PHP in EXIF
+                // metadata) do not survive in the stored preview image
+                $imageFactory->save($fileAbsolutePath);
+                $imageFactory->resize(350);
                 $imageFactory->save($thumbAbsolutePath);
             } catch (Exception $e) {
-                return null;
+                $mediaDirWrite->getDriver()->deleteFile($fileAbsolutePath);
+                throw new LocalizedException(__('The template preview image could not be processed.'));
             }
 
             $this->mediaStorage->saveFile($fileAbsolutePath);
@@ -280,11 +406,20 @@ class TemplateManagement implements TemplateManagementInterface
         }
 
         foreach ($convertedTemplate["assets"] as $asset) {
-            $reader = $this->filesystem->getDirectoryRead(DirectoryList::PUB);
-            $zip->addFile(
-                $reader->getAbsolutePath() . $asset,
-                TemplateAliasHelper::ASSETS_FOLDER_NAME . "/" . $asset
-            );
+            $normalizedAsset = ltrim(str_replace('\\', '/', $asset), '/');
+            $added = false;
+            if (str_starts_with($normalizedAsset, 'media/')) {
+                $added = $this->addContainedMediaFile(
+                    $zip,
+                    substr($normalizedAsset, strlen('media/')),
+                    TemplateAliasHelper::ASSETS_FOLDER_NAME . "/" . $asset
+                );
+            }
+            if (!$added) {
+                $this->logger->warning(
+                    sprintf('Template export skipped asset that does not resolve inside pub/media: %s', $asset)
+                );
+            }
         }
 
         foreach ($convertedTemplate["children"] as $childName => $child) {
@@ -328,10 +463,56 @@ class TemplateManagement implements TemplateManagementInterface
         TemplateInterface $template,
         string $exportPath
     ): void {
-        $previewFile = $this->filesystem
-                ->getDirectoryRead(DirectoryList::MEDIA)
-                ->getAbsolutePath() . $template->getPreviewImage();
-        $zip->addFile($previewFile, TemplateAliasHelper::PREVIEW_FILE);
+        $previewImage = ltrim(str_replace('\\', '/', (string)$template->getPreviewImage()), '/');
+        if ($previewImage === ''
+            || !$this->addContainedMediaFile($zip, $previewImage, TemplateAliasHelper::PREVIEW_FILE)
+        ) {
+            $this->logger->warning(
+                sprintf(
+                    'Template export skipped preview image that does not resolve inside pub/media: %s',
+                    (string)$template->getPreviewImage()
+                )
+            );
+        }
+    }
+
+    /**
+     * Add a media file to the export archive only when it resolves inside pub/media.
+     *
+     * Containment is enforced twice: the framework directory API validates
+     * the relative path lexically, and the resolved path is then re-checked
+     * with realpath() so symlinked entries cannot escape the media root.
+     *
+     * @param ZipArchive $zip
+     * @param string $mediaRelativePath
+     * @param string $entryName
+     * @return bool Whether the file was added to the archive
+     */
+    private function addContainedMediaFile(ZipArchive $zip, string $mediaRelativePath, string $entryName): bool
+    {
+        $mediaDirectory = $this->filesystem->getDirectoryRead(DirectoryList::MEDIA);
+        try {
+            if ($this->pathValidator->hasTraversal($mediaRelativePath)
+                || !$mediaDirectory->isFile($mediaRelativePath)
+            ) {
+                return false;
+            }
+            $absolutePath = $mediaDirectory->getAbsolutePath($mediaRelativePath);
+        } catch (ValidatorException $exception) {
+            return false;
+        }
+
+        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+        $mediaBasePath = realpath($mediaDirectory->getAbsolutePath());
+        // phpcs:ignore Magento2.Functions.DiscouragedFunction
+        $resolvedPath = realpath($absolutePath);
+        if ($mediaBasePath === false || $resolvedPath === false
+            || !str_starts_with($resolvedPath, $mediaBasePath . DIRECTORY_SEPARATOR)
+        ) {
+            return false;
+        }
+
+        return $zip->addFile($resolvedPath, $entryName);
     }
 
     /**
@@ -407,71 +588,147 @@ class TemplateManagement implements TemplateManagementInterface
      */
     public function importTemplateFromArchive(string $importPath, string $filePath = ""): ?TemplateInterface
     {
+        $this->assertSafeImportSubPath($filePath);
+
         $reader = $this->filesystem->getDirectoryRead(DirectoryList::VAR_EXPORT);
         $zip = new ZipArchive();
-        $zip->open($importPath);
-
-        $tmpFolder = $reader->getAbsolutePath() . "tmp";
-        $zip->extractTo($tmpFolder);
-        $zip->close();
-        if (substr($filePath, 0, 1) !== "/") {
-            $filePath = "/" . $filePath;
+        if ($zip->open($importPath) !== true) {
+            throw new LocalizedException(__('The uploaded file is not a valid template archive.'));
         }
-        $templateHtmlContent = $reader->readFile($tmpFolder . $filePath . "/" . TemplateAliasHelper::TEMPLATE_FILE);
 
-        $baseUrl = trim($this->storeManager->getStore()->getBaseUrl(), "/");
-        $baseUrl = $this->wysiswygNormalizer->replaceReservedCharacters($baseUrl);
-        $templateHtmlContent = str_replace(
-            TemplateAliasHelper::CMS_WIDGET_URL_PLACEHOLDER,
-            $baseUrl,
-            $templateHtmlContent
-        );
-        $previewFileName = $this->storePreviewImage(
-            $reader->readFile($tmpFolder . $filePath . "/" . TemplateAliasHelper::PREVIEW_FILE)
-        );
-        $exceptionMessages = $this->copyAssetsFilesToMediaDirectory(
-            $tmpFolder . $filePath . "/" . TemplateAliasHelper::ASSETS_FOLDER_NAME . "/media/",
-            $this->filesystem->getDirectoryRead(DirectoryList::MEDIA)->getAbsolutePath()
-        );
-        $childrenImportResult = $this->importTemplateChildren(
-            $tmpFolder . $filePath . "/" . TemplateAliasHelper::CHILDREN_FOLDER_NAME
-        );
-        $exceptionMessages = array_merge(
-            $exceptionMessages,
-            $childrenImportResult["exceptions"] ?? []
-        );
-
-        $templateHtmlContent = $this->substituteChildrenIds(
-            $templateHtmlContent,
-            $childrenImportResult["children"] ?? []
-        );
-
-        $templateHtmlContent = $this->substituteAdminhtmlStaticUrl($templateHtmlContent);
-
-        if (empty($exceptionMessages)) {
-            try {
-                $config = $this->xmlParser
-                    ->load($tmpFolder . $filePath . "/" . TemplateAliasHelper::CONFIG_FILE)
-                    ->xmlToArray()["config"];
-                $template = $this->templateFactory->create();
-                $template->setName($config["name"]);
-                $template->setTemplate($templateHtmlContent);
-                $template->setCreatedFor($config["type"]);
-                $template->setPreviewImage($previewFileName);
-                $importedTemplate = $this->templateRepository->save($template);
-
-                $this->fileDriver->deleteDirectory($tmpFolder);
-            } catch (Exception $e) {
-                throw new Exception("An error occurred saving template");
+        $tmpFolder = $reader->getAbsolutePath() . uniqid("tmp");
+        try {
+            $this->validateArchiveEntries($zip);
+            if (!$zip->extractTo($tmpFolder)) {
+                throw new LocalizedException(__('The template archive could not be extracted.'));
             }
-        } else {
-            throw new Exception("An error occurred saving template dependencies");
+        } finally {
+            $zip->close();
+        }
+
+        try {
+            if (substr($filePath, 0, 1) !== "/") {
+                $filePath = "/" . $filePath;
+            }
+            $templateHtmlContent = $reader->readFile(
+                $tmpFolder . $filePath . "/" . TemplateAliasHelper::TEMPLATE_FILE
+            );
+
+            $baseUrl = trim($this->storeManager->getStore()->getBaseUrl(), "/");
+            $baseUrl = $this->wysiswygNormalizer->replaceReservedCharacters($baseUrl);
+            $templateHtmlContent = str_replace(
+                TemplateAliasHelper::CMS_WIDGET_URL_PLACEHOLDER,
+                $baseUrl,
+                $templateHtmlContent
+            );
+            $previewFileName = $this->storePreviewImage(
+                $reader->readFile($tmpFolder . $filePath . "/" . TemplateAliasHelper::PREVIEW_FILE)
+            );
+            $exceptionMessages = $this->copyAssetsFilesToMediaDirectory(
+                $tmpFolder . $filePath . "/" . TemplateAliasHelper::ASSETS_FOLDER_NAME . "/media/",
+                $this->filesystem->getDirectoryRead(DirectoryList::MEDIA)->getAbsolutePath()
+            );
+            if (!empty($exceptionMessages)) {
+                throw new LocalizedException(
+                    __('The template assets could not be imported: %1', implode('; ', $exceptionMessages))
+                );
+            }
+            $childrenImportResult = $this->importTemplateChildren(
+                $tmpFolder . $filePath . "/" . TemplateAliasHelper::CHILDREN_FOLDER_NAME
+            );
+            $exceptionMessages = $childrenImportResult["exceptions"] ?? [];
+
+            $templateHtmlContent = $this->substituteChildrenIds(
+                $templateHtmlContent,
+                $childrenImportResult["children"] ?? []
+            );
+
+            $templateHtmlContent = $this->substituteAdminhtmlStaticUrl($templateHtmlContent);
+
+            if (empty($exceptionMessages)) {
+                try {
+                    $config = $this->xmlParser
+                        ->load($tmpFolder . $filePath . "/" . TemplateAliasHelper::CONFIG_FILE)
+                        ->xmlToArray()["config"];
+                    $template = $this->templateFactory->create();
+                    $template->setName($config["name"]);
+                    $template->setTemplate($templateHtmlContent);
+                    $template->setCreatedFor($config["type"]);
+                    $template->setPreviewImage($previewFileName);
+                    $importedTemplate = $this->templateRepository->save($template);
+                } catch (Exception $e) {
+                    throw new Exception("An error occurred saving template");
+                }
+            } else {
+                throw new Exception(
+                    "An error occurred saving template dependencies: " . implode("; ", $exceptionMessages)
+                );
+            }
+        } finally {
+            if ($this->fileDriver->isExists($tmpFolder)) {
+                $this->fileDriver->deleteDirectory($tmpFolder);
+            }
         }
 
         if ($importedTemplate && $importedTemplate->getId()) {
             return $importedTemplate;
         }
         return null;
+    }
+
+    /**
+     * Reject a caller-supplied import sub-path (e.g. the remote storage folder
+     * path) that could traverse outside the extraction directory when joined
+     * to the temporary folder.
+     *
+     * @param string $filePath
+     * @return void
+     * @throws LocalizedException
+     */
+    private function assertSafeImportSubPath(string $filePath): void
+    {
+        if ($this->pathValidator->hasTraversal($filePath)) {
+            throw new LocalizedException(__('The template import path is invalid.'));
+        }
+    }
+
+    /**
+     * Reject archives that could write outside the extraction directory
+     * (Zip-Slip / CWE-22) or exhaust disk space when extracted (zip bomb).
+     *
+     * @param ZipArchive $zip
+     * @return void
+     * @throws LocalizedException
+     */
+    private function validateArchiveEntries(ZipArchive $zip): void
+    {
+        if ($zip->numFiles > self::MAX_ARCHIVE_ENTRIES) {
+            throw new LocalizedException(__('The template archive contains too many files.'));
+        }
+
+        $totalSize = 0;
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $entryName = $zip->getNameIndex($i);
+            $entryStat = $zip->statIndex($i);
+            if ($entryName === false || $entryStat === false) {
+                throw new LocalizedException(__('The template archive could not be read.'));
+            }
+
+            $totalSize += $entryStat['size'];
+            if ($totalSize > self::MAX_ARCHIVE_UNCOMPRESSED_SIZE) {
+                throw new LocalizedException(__('The template archive is too large.'));
+            }
+
+            $normalizedName = str_replace('\\', '/', $entryName);
+            if ($this->pathValidator->hasTraversal($entryName)
+                || str_starts_with($normalizedName, '/')
+                || preg_match('#^[a-zA-Z]:#', $normalizedName) === 1
+            ) {
+                throw new LocalizedException(
+                    __('The template archive contains an unsafe file path: %1', $entryName)
+                );
+            }
+        }
     }
 
     /**

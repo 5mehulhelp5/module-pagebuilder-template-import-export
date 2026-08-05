@@ -57,14 +57,24 @@ class Import extends Action implements HttpPostActionInterface
                     ->getDirectoryRead(DirectoryList::VAR_EXPORT)->getAbsolutePath();
 
                 $uploader = $this->uploaderFactory->create(['fileId' => $binary]);
+                $uploader->setAllowedExtensions(['zip']);
                 $uploader->setFilesDispersion(false);
                 $uploader->setAllowRenameFiles(true);
                 $result = $uploader->save($destinationFolder);
 
                 $importedFilePath = $result['path'] . $result['file'];
-                $template = $this->templateManagement->importTemplateFromArchive($importedFilePath);
-                $externalUrls = $this->templateManagement->doSecurityScanForTemplate($template->getTemplate());
-                $result['external_urls'] = implode(',', $externalUrls);
+                try {
+                    $template = $this->templateManagement->importTemplateFromArchive($importedFilePath);
+                    $externalUrls = $this->templateManagement->doSecurityScanForTemplate($template->getTemplate());
+                    $result['external_urls'] = implode(',', $externalUrls);
+                } finally {
+                    // Do not keep the uploaded archive around once processed
+                    $varExportWrite = $this->filesystem->getDirectoryWrite(DirectoryList::VAR_EXPORT);
+                    $relativeArchivePath = $varExportWrite->getRelativePath($importedFilePath);
+                    if ($varExportWrite->isExist($relativeArchivePath)) {
+                        $varExportWrite->delete($relativeArchivePath);
+                    }
+                }
             }
 
         } catch (\Exception $e) {

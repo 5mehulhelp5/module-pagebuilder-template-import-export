@@ -16,6 +16,7 @@ use Magento\Framework\Serialize\Serializer\Serialize;
 use Magento\Cms\Api\BlockRepositoryInterface;
 use Magento\Store\Model\StoreManagerInterface;
 use MageOS\PageBuilderTemplateImportExport\Helper\Aliases as TemplateAliasHelper;
+use MageOS\PageBuilderTemplateImportExport\Model\PathValidator;
 
 class CmsConverter extends SerializedToJson
 {
@@ -39,6 +40,7 @@ class CmsConverter extends SerializedToJson
      * @param StoreManagerInterface $storeManager
      * @param ManagerInterface $messageManager
      * @param DeploymentConfig $deploymentConfig
+     * @param PathValidator $pathValidator
      */
     public function __construct(
         protected Normalizer $normalizer,
@@ -48,7 +50,8 @@ class CmsConverter extends SerializedToJson
         protected Serialize $serialize,
         protected StoreManagerInterface $storeManager,
         protected ManagerInterface $messageManager,
-        protected DeploymentConfig $deploymentConfig
+        protected DeploymentConfig $deploymentConfig,
+        protected PathValidator $pathValidator
     ) {
         parent::__construct($serialize, $json);
     }
@@ -97,7 +100,13 @@ class CmsConverter extends SerializedToJson
                 if (!isset($parts[1])) {
                     continue;
                 }
-                $url = $parts[1];
+                $url = trim($parts[1], " \t\n\r\0\x0B\"'");
+                if (!$this->pathValidator->isSafeRelativePath($url)) {
+                    $this->messageManager->addWarningMessage(
+                        (string)__('Skipped template asset with unsafe media path: %1', $parts[1])
+                    );
+                    continue;
+                }
                 if (!in_array("/media/" . $url, $this->assets)) {
                     $this->assets[] = "/media/" . $url;
                 }
@@ -128,6 +137,28 @@ class CmsConverter extends SerializedToJson
             return $convertedValue;
         }
         return ["value" => $convertedValue, "assets" => $this->assets, "children" => $this->cmsBlocks];
+    }
+
+    /**
+     * Whether an extracted asset path is a safe file under pub/media.
+     *
+     * Accepts a "media/"-rooted path (with or without a leading slash) whose
+     * remainder is a plain relative path, matching the containment the export
+     * file-access layer enforces. Absolute non-media paths, traversal, and
+     * scheme/drive prefixes are rejected so nothing outside pub/media is
+     * collected for export.
+     *
+     * @param string $path
+     * @return bool
+     */
+    private function isCollectableMediaPath(string $path): bool
+    {
+        $normalized = ltrim(str_replace('\\', '/', $path), '/');
+        if (!str_starts_with($normalized, 'media/')) {
+            return false;
+        }
+
+        return $this->pathValidator->isSafeRelativePath(substr($normalized, strlen('media/')));
     }
 
     /**
@@ -226,8 +257,13 @@ class CmsConverter extends SerializedToJson
                             if (filter_var($value, FILTER_VALIDATE_URL) && $url = parse_url($value)) {
                                 $item[$label] = str_replace($url["scheme"] .
                                     "://" . $url["host"], TemplateAliasHelper::CMS_WIDGET_URL_PLACEHOLDER, $value);
-                                if (!in_array($url["path"], $this->assets)) {
-                                    $this->assets[] = $url["path"];
+                                $path = $url["path"] ?? '';
+                                if (!$this->isCollectableMediaPath($path)) {
+                                    $this->messageManager->addWarningMessage(
+                                        (string)__('Skipped template asset with unsafe media path: %1', $value)
+                                    );
+                                } elseif (!in_array($path, $this->assets)) {
+                                    $this->assets[] = $path;
                                 }
                             }
                         }
