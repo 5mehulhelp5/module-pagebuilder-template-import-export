@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## 1.9.1 - 2026-10-27
+### Fixed
+- Fix the remote template cron job referencing a non-existent class, so the template list is refreshed nightly again (#22, #24).
+
 ## 1.9.0 - 2026-08-05
 ### Security
 - Restrict PageBuilder template import to `.zip` uploads
